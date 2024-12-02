@@ -1,231 +1,172 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
-import importlib
 import os
-import pathlib
-import signal
 import sys
-import threading
 import time
-from collections import OrderedDict
-from threading import Thread, Lock
-import easytrader
-from instock.trade.robot.engine.event_engine import EventEngine
-from instock.trade.robot.engine.clock_engine import ClockEngine
-from instock.trade.robot.infrastructure.default_handler import DefaultLogHandler
+import signal
+import threading
+from collections import defaultdict
+from importlib import import_module
+from types import ModuleType
+from typing import Dict, List, Tuple
 
-__author__ = 'myh '
-__date__ = '2023/4/10 '
-
+from ..infrastructure.log import logger
+from ..infrastructure.strategy_wrapper import StrategyWrapper
+from .event_engine import EventEngine
 
 class MainEngine:
-    """主引擎，负责行情 / 事件驱动引擎 / 交易"""
-
-    def __init__(self, broker=None, need_data=None, log_handler=DefaultLogHandler(), tzinfo=None):
-        """初始化事件 / 行情 引擎并启动事件引擎
-        """
-        self.log = log_handler
-        self.broker = broker
-
-        # 登录账户
-        if (broker is not None) and (need_data is not None):
-            self.user = easytrader.use(broker)
-            need_data_file = pathlib.Path(need_data)
-            if need_data_file.exists():
-                self.user.prepare(need_data)
-            else:
-                self.log.warn("券商账号信息文件 %s 不存在, easytrader 将不可用" % need_data)
-        else:
-            self.user = None
-            self.log.info('选择了无交易模式')
-
-        self.event_engine = EventEngine()
-        self.clock_engine = ClockEngine(self.event_engine, tzinfo)
-
-        # 保存读取的策略类
-        self.strategies = OrderedDict()
-        self.strategy_list = list()
-
-        # 是否要动态重载策略
+    """Main engine for managing strategies and events"""
+    
+    def __init__(self, event_engine: EventEngine):
+        """Initialize main engine"""
+        self.event_engine = event_engine
+        
+        # Login account
+        self.account = None
+        
+        # Strategy instances
+        self.strategies = {}
+        
+        # Strategy wrappers
+        self.strategy_wrappers = {}
+        
+        # Save loaded strategy classes
+        self.strategy_classes = {}
+        
+        # Whether to dynamically reload strategies
         self.is_watch_strategy = False
-        # 修改时间缓存
-        self._cache = {}
-        # # 文件进程映射
-        # self._process_map = {}
-        # 文件模块映射
-        self._modules = {}
-        self._names = None
-        # 加载锁
-        self.lock = Lock()
-        # 加载线程
-        self._watch_thread = Thread(target=self._load_strategy, name="MainEngine.watch_reload_strategy")
-
-        # shutdown 函数
-        self.before_shutdown = []  # 关闭引擎前的 shutdown
-        self.main_shutdown = []  # 引擎自身要执行的 shutdown
-        self.after_shutdown = []  # 关闭引擎后的 shutdown
-        self.shutdown_signals = [
-            signal.SIGINT,  # 键盘信号
-            signal.SIGTERM,  # kill 命令
-        ]
-        if sys.platform != 'win32':
-            self.shutdown_signals.extend([signal.SIGHUP, signal.SIGQUIT])
-
-        for s in self.shutdown_signals:
-            # 捕获退出信号后的要调用的,唯一的 shutdown 接口
-            signal.signal(s, self._shutdown)
-
-        self.log.info('启动主引擎')
-
-    def start(self):
-        """启动主引擎"""
-        self.event_engine.start()
-        self._add_main_shutdown(self.event_engine.stop)
-
-        self.log.warn("sleep 10s 等待账户加载")
-        time.sleep(10)
-
-        self.clock_engine.start()
-        self._add_main_shutdown(self.clock_engine.stop)
-
-    def load(self, names, strategy_file):
-        with self.lock:
-            mtime = os.path.getmtime(os.path.join('strategies', strategy_file))
-
-            # 是否需要重新加载
-            reload = False
-
-            strategy_module_name = os.path.basename(strategy_file)[:-3]
-            new_module = lambda strategy_module_name: importlib.import_module('.' + strategy_module_name, 'strategies')
-            strategy_module = self._modules.get(
-                strategy_file,  # 从缓存中获取 module 实例
-                new_module(strategy_module_name)  # 创建新的 module 实例
-            )
-
-            if self._cache.get(strategy_file, None) == mtime:
-                # 检查最后改动时间
-                return
-            elif self._cache.get(strategy_file, None) is not None:
-                # 注销策略的监听
-                old_strategy = self.get_strategy(strategy_module.Strategy.name)
-                if old_strategy is None:
-                    for s in self.strategy_list:
-                        print(s.name)
-                self.log.warn(u'卸载策略: %s' % old_strategy.name)
-                self.strategy_listen_event(old_strategy, "unlisten")
-                time.sleep(2)
-                reload = True
-            # 重新加载
-            if reload:
-                strategy_module = importlib.reload(strategy_module)
-
-            self._modules[strategy_file] = strategy_module
-
-            strategy_class = getattr(strategy_module, 'Strategy')
-            if names is None or strategy_class.name in names:
-                self.strategies[strategy_module_name] = strategy_class
-                # 缓存加载信息
-                new_strategy = strategy_class(user=self.user, log_handler=self.log, main_engine=self)
-                self.strategy_list.append(new_strategy)
-                self._cache[strategy_file] = mtime
-                self.strategy_listen_event(new_strategy, "listen")
-                self.log.info(u'加载策略: %s' % strategy_module_name)
-
-    def strategy_listen_event(self, strategy, _type="listen"):
-        """
-        所有策略要监听的事件都绑定到这里
-        :param strategy: Strategy()
-        :param _type: "listen" OR "unlisten"
-        :return:
-        """
-        func = {
-            "listen": self.event_engine.register,
-            "unlisten": self.event_engine.unregister,
-        }.get(_type)
-
-        # 时钟事件
-        func(ClockEngine.EventType, strategy.clock)
-
-    def load_strategy(self, names=None):
-        """动态加载策略
-        :param names: 策略名列表，元素为策略的 name 属性"""
-        s_folder = 'strategies'
-        self._names = names
-        strategies = os.listdir(s_folder)
-        strategies = filter(lambda file: file.endswith('.py') and file != '__init__.py', strategies)
-        importlib.import_module(s_folder)
-        for strategy_file in strategies:
-            self.load(self._names, strategy_file)
-        # 如果线程没有启动，就启动策略监视线程
-        if self.is_watch_strategy and not self._watch_thread.is_alive():
-            self.log.warn("启用了动态加载策略功能")
-            self._watch_thread.start()
-
+        
+        # Modified time cache
+        self.strategy_file_mt_map = {}
+        
+        # File process mapping
+        self.strategy_process_map = {}
+        
+        # File module mapping
+        self.strategy_module_map = {}
+        
+        # Loading lock
+        self._strategy_lock = threading.Lock()
+        
+        # Loading thread
+        self._strategy_thread = None
+        
+        # Shutdown functions
+        self.before_shutdown = []  # Functions to execute before engine shutdown
+        self.main_shutdown = []  # Functions for engine's own shutdown
+        self.after_shutdown = []  # Functions to execute after engine shutdown
+        
+        signal.signal(
+            signal.SIGINT,  # Keyboard signal
+            self._shutdown
+        )
+        signal.signal(
+            signal.SIGTERM,  # Kill command
+            self._shutdown
+        )
+    
+    def _shutdown(self, sig, frame):
+        """Single shutdown interface to be called after capturing exit signals"""
+        logger.info("Received exit signal, executing shutdown sequence...")
+        
+        for func in self.before_shutdown:
+            logger.debug("Executing pre-shutdown function: %s", func.__name__)
+            func()
+        
+        self.stop()
+        
+        for func in self.after_shutdown:
+            logger.debug("Executing post-shutdown function: %s", func.__name__)
+            func()
+        
+        logger.info("Shutdown sequence completed")
+        sys.exit(0)
+    
+    def load_strategy(self):
+        """Load strategy"""
+        with self._strategy_lock:
+            self._load_strategy()
+    
     def _load_strategy(self):
+        """Internal method to load strategy"""
+        # Check if need to reload
+        for strategy_file, strategy_module in self.strategy_module_map.items():
+            # Get module instance from cache
+            new_module = self._load_strategy_module(
+                strategy_file,  # Get module instance from cache
+                import_module(strategy_module.__name__)  # Create new module instance
+            )
+            
+            if new_module is None:
+                continue
+                
+            # Check last modified time
+            file_mt = os.stat(strategy_file).st_mtime
+            if file_mt > self.strategy_file_mt_map[strategy_file]:
+                # Unregister strategy's listeners
+                for strategy_name in self.strategy_process_map[strategy_file]:
+                    self.strategy_wrappers[strategy_name].stop()
+                    self.strategies.pop(strategy_name, None)
+                
+                # Reload
+                self.strategy_module_map[strategy_file] = new_module
+                self.strategy_file_mt_map[strategy_file] = file_mt
+                
+                # Cache loading info
+                for name, strategy_class in new_module.__dict__.items():
+                    if getattr(strategy_class, 'is_strategy', False):
+                        self.strategy_classes[name] = strategy_class
+                        strategy = strategy_class(self)
+                        self.strategies[name] = strategy
+                        self.strategy_wrappers[name] = StrategyWrapper(strategy)
+                        self.strategy_process_map[strategy_file].append(name)
+    
+    def start(self):
+        """Start engine"""
+        # Clock event
+        self.event_engine.start()
+        
+        # Start strategy wrappers
+        for strategy_wrapper in self.strategy_wrappers.values():
+            strategy_wrapper.start()
+        
+        # If thread hasn't started, start strategy monitoring thread
+        if self.is_watch_strategy and self._strategy_thread is None:
+            self._strategy_thread = threading.Thread(target=self._watch_strategy)
+            self._strategy_thread.daemon = True
+            self._strategy_thread.start()
+    
+    def stop(self):
+        """Stop engine"""
+        # All pre-shutdown triggers
+        for func in self.before_shutdown:
+            func()
+        
+        # Engine's own shutdown
+        self.event_engine.stop()
+        
+        # Wait for all threads to close until only main thread remains
+        for strategy_wrapper in self.strategy_wrappers.values():
+            strategy_wrapper.stop()
+        
+        # Call strategy's shutdown
+        for strategy in self.strategies.values():
+            if hasattr(strategy, 'shutdown'):
+                strategy.shutdown()
+        
+        # All post-shutdown triggers
+        for func in self.after_shutdown:
+            func()
+        
+        # Exit
+        sys.exit(0)
+    
+    def _watch_strategy(self):
+        """Watch strategy files for changes"""
         while True:
             try:
-                self.load_strategy(self._names)
-                time.sleep(2)
+                self.load_strategy()
             except Exception as e:
-                print(e)
-
-    def get_strategy(self, name):
-        for strategy in self.strategy_list:
-            if strategy.name == name:
-                return strategy
-        return None
-
-    def add_before_shutdown(self, shutdown):
-
-        if not hasattr(shutdown, "__call__"):
-            n = shutdown.__name__ if hasattr(shutdown, "__name__") else str(shutdown)
-            raise ValueError("%s 不是可调用对象 " % n)
-
-        self.before_shutdown.append(shutdown)
-
-    def add_after_shutdown(self, shutdown):
-        if not hasattr(shutdown, "__call__"):
-            n = shutdown.__name__ if hasattr(shutdown, "__name__") else str(shutdown)
-            raise ValueError("%s 不是可调用对象 " % n)
-
-        self.after_shutdown.append(shutdown)
-
-    def _add_main_shutdown(self, shutdown):
-        if not hasattr(shutdown, "__call__"):
-            n = shutdown.__name__ if hasattr(shutdown, "__name__") else str(shutdown)
-            raise ValueError("%s 不是可调用对象 " % n)
-
-        self.main_shutdown.append(shutdown)
-
-    def _shutdown(self, sig, frame):
-        """
-        关闭进程前的处理
-        :return:
-        """
-        self.log.debug("开始关闭进程...")
-        # 所有 shutdown 前的触发点
-        for st in self.before_shutdown:
-            st()
-
-        # 引擎自身的 shutdown
-        for st in self.main_shutdown:
-            st()
-
-        # 等待所有线程关闭, 直到只留下主线程
-        c = threading.active_count()
-        while threading.active_count() != c:
+                logger.error("Strategy reload failed: %s", e)
             time.sleep(2)
-
-        # 调用策略的 shutdown
-        self.log.debug("开始关闭策略...")
-        for s in self.strategy_list:
-            s.shutdown()
-
-        # 所有 shutdown 后的触发点
-        for st in self.after_shutdown:
-            st()
-
-        # 退出
-        time.sleep(.1)
-        sys.exit(1)

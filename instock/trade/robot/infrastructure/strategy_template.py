@@ -1,42 +1,31 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
+from abc import ABC, abstractmethod
+from typing import Optional
 
-__author__ = 'myh '
-__date__ = '2023/4/10 '
+from ..infrastructure.log import logger
 
+class StrategyTemplate(ABC):
+    """Base class for all strategies"""
 
-class StrategyTemplate:
-    name = 'DefaultStrategyTemplate'
-
-    def __init__(self, user, log_handler, main_engine):
-        self.user = user
-        self.main_engine = main_engine
-        self.clock_engine = main_engine.clock_engine
-        # 优先使用自定义 log 句柄, 否则使用主引擎日志句柄
-        self.log = self.log_handler() or log_handler
+    def __init__(self, log_handler=None):
+        """Initialize strategy"""
+        # Prioritize using custom log handler, otherwise use main engine log handler
+        self.log = log_handler if log_handler else logger
+        
+        # Perform relevant initialization operations
         self.init()
-
+    
     def init(self):
-        # 进行相关的初始化操作
+        """Initialize strategy, can be overridden by child classes"""
         pass
-
-    def strategy(self):
-        pass
-
+    
+    @abstractmethod
     def clock(self, event):
+        """Clock event handler, must be implemented by child classes"""
         pass
-
-    def log_handler(self):
-        """
-        优先使用在此自定义 log 句柄, 否则返回None, 并使用主引擎日志句柄
-        :return: log_handler or None
-        """
-        return None
-
+    
     def shutdown(self):
-        """
-        关闭进程前调用该函数
-        :return:
-        """
+        """Shutdown strategy, can be overridden by child classes"""
         pass

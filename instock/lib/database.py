@@ -11,196 +11,131 @@ from sqlalchemy import inspect
 __author__ = 'myh '
 __date__ = '2023/3/10 '
 
-db_host = "localhost"  # 数据库服务主机
-db_user = "root"  # 数据库访问用户
-db_password = "root"  # 数据库访问密码
-db_database = "instockdb"  # 数据库名称
-db_port = 3306  # 数据库服务端口
-db_charset = "utf8mb4"  # 数据库字符集
+db_host = "localhost"  # Database server host
+db_user = "root"  # Database access user
+db_password = "root"  # Database access password
+db_database = "instockdb"  # Database name
+db_port = 3306  # Database service port
+db_charset = "utf8mb4"  # Database character set
 
-# 使用环境变量获得数据库,docker -e 传递
-_db_host = os.environ.get('db_host')
-if _db_host is not None:
-    db_host = _db_host
-_db_user = os.environ.get('db_user')
-if _db_user is not None:
-    db_user = _db_user
-_db_password = os.environ.get('db_password')
-if _db_password is not None:
-    db_password = _db_password
-_db_database = os.environ.get('db_database')
-if _db_database is not None:
-    db_database = _db_database
-_db_port = os.environ.get('db_port')
-if _db_port is not None:
-    db_port = int(_db_port)
+# Get database configuration from environment variables, passed through docker -e
+db_host = os.environ.get('db_host') if os.environ.get('db_host') else db_host
+db_user = os.environ.get('db_user') if os.environ.get('db_user') else db_user
+db_password = os.environ.get('db_password') if os.environ.get('db_password') else db_password
+db_database = os.environ.get('db_database') if os.environ.get('db_database') else db_database
+db_port = os.environ.get('db_port') if os.environ.get('db_port') else db_port
+db_charset = os.environ.get('db_charset') if os.environ.get('db_charset') else db_charset
 
-MYSQL_CONN_URL = "mysql+pymysql://%s:%s@%s:%s/%s?charset=%s" % (
-    db_user, db_password, db_host, db_port, db_database, db_charset)
-logging.info(f"数据库链接信息：{ MYSQL_CONN_URL}")
+# Create the database connection string
+DB_CONN_URL = f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_database}?charset={db_charset}"
 
-MYSQL_CONN_DBAPI = {'host': db_host, 'user': db_user, 'password': db_password, 'database': db_database,
-                    'charset': db_charset, 'port': db_port, 'autocommit': True}
+# Database connection engine
+engine = create_engine(
+    DB_CONN_URL,
+    encoding='utf8',
+    echo=False,
+    max_overflow=0,  # Maximum number of connections to overflow
+    pool_size=5,  # Connection pool size
+    pool_timeout=30,  # Connection pool timeout
+    pool_recycle=1*3600  # Connection pool recycle time
+)
 
-MYSQL_CONN_TORNDB = {'host': f'{db_host}:{str(db_port)}', 'user': db_user, 'password': db_password,
-                     'database': db_database, 'charset': db_charset, 'max_idle_time': 3600, 'connect_timeout': 1000}
+# DB Api - Database connection object
+conn = engine.connect()
 
+def insert_db(data, table_name, write_index=False, primary_keys=None):
+    """
+    Define a general method function to insert data into database tables and create database primary keys,
+    ensuring index uniqueness when rerunning data.
+    """
+    # Insert into default database
+    return _insert_impl(data, table_name, write_index, primary_keys, DB_CONN_URL)
 
-# 通过数据库链接 engine
-def engine():
-    return create_engine(MYSQL_CONN_URL)
+def insert_other_db(data, table_name, write_index, primary_keys, url):
+    """Add a method to insert into other databases."""
+    return _insert_impl(data, table_name, write_index, primary_keys, url)
 
-
-def engine_to_db(to_db):
-    _engine = create_engine(MYSQL_CONN_URL.replace(f'/{db_database}?', f'/{to_db}?'))
-    return _engine
-
-
-# DB Api -数据库连接对象connection
-def get_connection():
-    try:
-        return pymysql.connect(**MYSQL_CONN_DBAPI)
-    except Exception as e:
-        logging.error(f"database.conn_not_cursor处理异常：{MYSQL_CONN_DBAPI}{e}")
-    return None
-
-
-# 定义通用方法函数，插入数据库表，并创建数据库主键，保证重跑数据的时候索引唯一。
-def insert_db_from_df(data, table_name, cols_type, write_index, primary_keys, indexs=None):
-    # 插入默认的数据库。
-    insert_other_db_from_df(None, data, table_name, cols_type, write_index, primary_keys, indexs)
-
-
-# 增加一个插入到其他数据库的方法。
-def insert_other_db_from_df(to_db, data, table_name, cols_type, write_index, primary_keys, indexs=None):
-    # 定义engine
-    if to_db is None:
-        engine_mysql = engine()
+def _insert_impl(data, table_name, write_index, primary_keys, url):
+    # Define engine
+    engine = create_engine(
+        url,
+        encoding='utf8',
+        echo=False
+    )
+    # Using http://docs.sqlalchemy.org/en/latest/core/reflection.html
+    # Use inspection to check if the database table has a primary key
+    insp = inspect(engine)
+    if primary_keys is None:
+        # If there is an index, add the index to varchar
+        data.to_sql(table_name, engine, index=write_index, if_exists='append')
     else:
-        engine_mysql = engine_to_db(to_db)
-    # 使用 http://docs.sqlalchemy.org/en/latest/core/reflection.html
-    # 使用检查检查数据库表是否有主键。
-    ipt = inspect(engine_mysql)
-    col_name_list = data.columns.tolist()
-    # 如果有索引，把索引增加到varchar上面。
-    if write_index:
-        # 插入到第一个位置：
-        col_name_list.insert(0, data.index.name)
+        # Insert at the first position:
+        dtype = {}
+        for k in primary_keys:
+            dtype[k] = NVARCHAR(40)
+        data.to_sql(table_name, engine, index=write_index, if_exists='append', dtype=dtype)
+        # Check if primary key exists
+        if not insp.get_pk_constraint(table_name)['constrained_columns']:
+            with engine.connect() as con:
+                # Execute database insert data
+                con.execute('ALTER TABLE `%s` ADD PRIMARY KEY (%s);' % (table_name, ",".join(primary_keys)))
+    return True
+
+def update_data(sql):
+    """Update data"""
     try:
-        if cols_type is None:
-            data.to_sql(name=table_name, con=engine_mysql, schema=to_db, if_exists='append',
-                        index=write_index, )
-        elif not cols_type:
-            data.to_sql(name=table_name, con=engine_mysql, schema=to_db, if_exists='append',
-                        dtype={col_name: NVARCHAR(255) for col_name in col_name_list}, index=write_index, )
-        else:
-            data.to_sql(name=table_name, con=engine_mysql, schema=to_db, if_exists='append',
-                        dtype=cols_type, index=write_index, )
+        conn.execute(sql)
     except Exception as e:
-        logging.error(f"database.insert_other_db_from_df处理异常：{table_name}表{e}")
+        print("Execution error: " + sql)
+        print(e)
 
-    # 判断是否存在主键
-    if not ipt.get_pk_constraint(table_name)['constrained_columns']:
-        try:
-            # 执行数据库插入数据。
-            with get_connection() as conn:
-                with conn.cursor() as db:
-                    db.execute(f'ALTER TABLE `{table_name}` ADD PRIMARY KEY ({primary_keys});')
-                    if indexs is not None:
-                        for k in indexs:
-                            db.execute(f'ALTER TABLE `{table_name}` ADD INDEX IN{k}({indexs[k]});')
-        except Exception as e:
-            logging.error(f"database.insert_other_db_from_df处理异常：{table_name}表{e}")
+def query_data(sql):
+    """Query data"""
+    result = []
+    try:
+        result = conn.execute(sql).fetchall()
+    except Exception as e:
+        print("Execution error: " + sql)
+        print(e)
+    return result
 
+def check_table_exists(table_name):
+    """Check if table exists"""
+    return inspect(engine).has_table(table_name)
 
-# 更新数据
-def update_db_from_df(data, table_name, where):
-    data = data.where(data.notnull(), None)
-    update_string = f'UPDATE `{table_name}` set '
-    where_string = ' where '
-    cols = tuple(data.columns)
-    with get_connection() as conn:
-        with conn.cursor() as db:
-            try:
-                for row in data.values:
-                    sql = update_string
-                    sql_where = where_string
-                    for index, col in enumerate(cols):
-                        if col in where:
-                            if len(sql_where) == len(where_string):
-                                if type(row[index]) == str:
-                                    sql_where = f'''{sql_where}`{col}` = '{row[index]}' '''
-                                else:
-                                    sql_where = f'''{sql_where}`{col}` = {row[index]} '''
-                            else:
-                                if type(row[index]) == str:
-                                    sql_where = f'''{sql_where} and `{col}` = '{row[index]}' '''
-                                else:
-                                    sql_where = f'''{sql_where} and `{col}` = {row[index]} '''
-                        else:
-                            if type(row[index]) == str:
-                                if row[index] is None or row[index] != row[index]:
-                                    sql = f'''{sql}`{col}` = NULL, '''
-                                else:
-                                    sql = f'''{sql}`{col}` = '{row[index]}', '''
-                            else:
-                                if row[index] is None or row[index] != row[index]:
-                                    sql = f'''{sql}`{col}` = NULL, '''
-                                else:
-                                    sql = f'''{sql}`{col}` = {row[index]}, '''
-                    sql = f'{sql[:-2]}{sql_where}'
-                    db.execute(sql)
-            except Exception as e:
-                logging.error(f"database.update_db_from_df处理异常：{sql}{e}")
+def execute(sql, params=None):
+    """Execute SQL"""
+    try:
+        if params is None:
+            conn.execute(sql)
+        else:
+            conn.execute(sql, params)
+    except Exception as e:
+        print("Execution error: " + sql)
+        print(e)
 
+def query(sql, params=None):
+    """Query data"""
+    result = []
+    try:
+        if params is None:
+            result = conn.execute(sql).fetchall()
+        else:
+            result = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        print("Execution error: " + sql)
+        print(e)
+    return result
 
-# 检查表是否存在
-def checkTableIsExist(tableName):
-    with get_connection() as conn:
-        with conn.cursor() as db:
-            db.execute("""
-                SELECT COUNT(*)
-                FROM information_schema.tables
-                WHERE table_name = '{0}'
-                """.format(tableName.replace('\'', '\'\'')))
-            if db.fetchone()[0] == 1:
-                return True
-    return False
-
-
-# 增删改数据
-def executeSql(sql, params=()):
-    with get_connection() as conn:
-        with conn.cursor() as db:
-            try:
-                db.execute(sql, params)
-            except Exception as e:
-                logging.error(f"database.executeSql处理异常：{sql}{e}")
-
-
-# 查询数据
-def executeSqlFetch(sql, params=()):
-    with get_connection() as conn:
-        with conn.cursor() as db:
-            try:
-                db.execute(sql, params)
-                return db.fetchall()
-            except Exception as e:
-                logging.error(f"database.executeSqlFetch处理异常：{sql}{e}")
-    return None
-
-
-# 计算数量
-def executeSqlCount(sql, params=()):
-    with get_connection() as conn:
-        with conn.cursor() as db:
-            try:
-                db.execute(sql, params)
-                result = db.fetchall()
-                if len(result) == 1:
-                    return int(result[0][0])
-                else:
-                    return 0
-            except Exception as e:
-                logging.error(f"database.select_count计算数量处理异常：{e}")
-    return 0
+def count(sql, params=None):
+    """Count records"""
+    result = []
+    try:
+        if params is None:
+            result = conn.execute(sql).fetchall()
+        else:
+            result = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        print("Execution error: " + sql)
+        print(e)
+    return int(result[0][0])

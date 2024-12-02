@@ -1,230 +1,106 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
-import datetime
-from collections import deque
-from threading import Thread
-import arrow
-from dateutil import tz
 import time
-import instock.lib.trade_time as etime
-from instock.trade.robot.engine.event_engine import Event
+import datetime
+from typing import Dict, List, Optional
+from dateutil import tz
 
-__author__ = 'myh '
-__date__ = '2023/4/10 '
-
-
-class Clock:
-    def __init__(self, trading_time, clock_event):
-        self.trading_state = trading_time
-        self.clock_event = clock_event
-
-
-class ClockIntervalHandler:
-    def __init__(self, clock_engine, interval, trading=True, call=None):
-        """
-        :param interval: float(minute)
-        :param trading: 在交易阶段才触发
-        :return:
-        """
-        self.clock_engine = clock_engine
-        self.clock_type = interval
-        self.interval = interval
-        self.second = int(interval * 60)
-        self.trading = trading
-        self.call = call or (lambda: None)
-
-    def is_active(self):
-        if self.trading:
-            if not self.clock_engine.trading_state:
-                return False
-        return int(self.clock_engine.now) % self.second == 0
-
-    def __eq__(self, other):
-        if isinstance(other, ClockIntervalHandler):
-            return self.interval == other.interval
-        else:
-            return False
-
-    def __hash__(self):
-        return self.second
-
-
-class ClockMomentHandler:
-    def __init__(self, clock_engine, clock_type, moment=None, is_trading_date=True, makeup=False, call=None):
-        """
-        :param clock_type:
-        :param moment: datetime.time
-        :param is_trading_date: bool(是否只有在交易日触发)
-        :param makeup: 注册时,如果已经过了触发时机,是否立即触发
-        :return:
-        """
-        self.clock_engine = clock_engine
-        self.clock_type = clock_type
-        self.moment = moment
-        self.is_trading_date = is_trading_date
-        self.makeup = makeup
-        self.call = call or (lambda: None)
-        self.next_time = datetime.datetime.combine(
-            self.clock_engine.now_dt.date(),
-            self.moment,
-        )
-
-        if not self.makeup and self.is_active():
-            self.update_next_time()
-
-    def update_next_time(self):
-        """
-        下次激活时间
-        :return:
-        """
-        if self.is_active():
-            if self.is_trading_date:
-                next_date = etime.get_next_trade_date(self.clock_engine.now_dt.date())
-            else:
-                next_date = self.next_time.date() + datetime.timedelta(days=1)
-
-            self.next_time = datetime.datetime.combine(
-                next_date,
-                self.moment
-            )
-
-    def is_active(self):
-        if self.is_trading_date and not etime.is_trade_date(self.clock_engine.now_dt.date()):
-            # 仅在交易日触发时的判断
-            return False
-        return self.next_time <= self.clock_engine.now_dt
-
+from ..infrastructure.log import logger
+from .event_engine import EventEngine
 
 class ClockEngine:
-    """
-    时间推送引擎
-    1. 提供统一的 now 时间戳.
-    """
-    EventType = 'clock_tick'
-
-    def __init__(self, event_engine, tzinfo=None):
-        """
-        :param event_engine:
-        :param event_engine: tzinfo
-        :return:
-        """
-        # 默认使用当地时间的时区
-        self.tzinfo = tzinfo or tz.tzlocal()
-
+    """Clock engine for managing time-based events"""
+    
+    def __init__(self, event_engine: EventEngine, timezone: Optional[datetime.tzinfo] = None):
+        """Initialize clock engine"""
         self.event_engine = event_engine
         self.is_active = True
-        self.clock_engine_thread = Thread(target=self.clocktick, name="ClockEngine.clocktick")
-        self.sleep_time = 1
-        self.trading_state = True if (etime.is_tradetime(datetime.datetime.now()) and etime.is_trade_date(
-            datetime.datetime.now().date())) else False
-        self.clock_moment_handlers = deque()
-        self.clock_interval_handlers = set()
-
-        self._init_clock_handler()
-
-    def _init_clock_handler(self):
-        """
-        注册默认的时钟事件
-        :return:
-        """
-
-        # 开盘事件
-        def _open():
-            self.trading_state = True
-
-        self._register_moment('open', datetime.time(9, tzinfo=self.tzinfo), makeup=True, call=_open)
-
-        # 中午休市
-        self._register_moment('pause', datetime.time(11, 30, tzinfo=self.tzinfo), makeup=True)
-
-        # 下午开盘
-        self._register_moment('continue', datetime.time(13, tzinfo=self.tzinfo), makeup=True)
-
-        # 收盘事件
-        def close():
-            self.trading_state = False
-
-        self._register_moment('close', datetime.time(15, tzinfo=self.tzinfo), makeup=True, call=close)
-
-        # 间隔事件
-        for interval in (0.5, 1, 5, 15, 30, 60):
-            self.register_interval(interval)
-
-    @property
-    def now(self):
-        """
-        now 时间戳统一接口
-        :return:
-        """
-        return time.time()
-
-    @property
-    def now_dt(self):
-        """
-        :return: datetime 类型, 带时区的时间戳.建议使用 arrow 库
-        """
-        return arrow.get(self.now).to(self.tzinfo)
-
+        
+        # Default to local timezone
+        self.timezone = timezone or tz.tzlocal()
+        
+        # Event handlers
+        self.clock_engine_handlers = []
+        
+        # Market open/close times
+        self.trading_state = True
+        self.clock_moment_handlers = {
+            "open": (datetime.time(9, 30, 0), self._open_handler),
+            "lunch_break": (datetime.time(11, 30, 0), self._lunch_break_handler),
+            "afternoon_open": (datetime.time(13, 0, 0), self._afternoon_open_handler),
+            "close": (datetime.time(15, 0, 0), self._close_handler),
+        }
+        
+        # Interval events
+        self.clock_interval_handlers = []
+    
+    def _is_trading_date(self, now: datetime.datetime) -> bool:
+        """Check if it's a trading day"""
+        # Only trigger on trading days
+        if now.weekday() >= 5:
+            return False
+        return True
+    
+    def _open_handler(self, event):
+        """Market open event handler"""
+        self.trading_state = True
+        logger.info("Market opened")
+    
+    def _lunch_break_handler(self, event):
+        """Lunch break event handler"""
+        self.trading_state = False
+        logger.info("Lunch break started")
+    
+    def _afternoon_open_handler(self, event):
+        """Afternoon open event handler"""
+        self.trading_state = True
+        logger.info("Afternoon session opened")
+    
+    def _close_handler(self, event):
+        """Market close event handler"""
+        self.trading_state = False
+        logger.info("Market closed")
+    
+    def register_moment(self, clock_type: str, moment: datetime.time):
+        """Register moment event"""
+        self.clock_moment_handlers[clock_type] = (moment, None)
+    
+    def register_interval(self, interval: float, trading: bool = True):
+        """Register interval event"""
+        self.clock_interval_handlers.append((interval, trading))
+    
     def start(self):
-        self.clock_engine_thread.start()
-
-    def clocktick(self):
+        """Start clock engine"""
+        self.is_active = True
+        
         while self.is_active:
-            self.tock()
-            time.sleep(self.sleep_time)
-
-    def tock(self):
-        if not etime.is_trade_date(self.now_dt.date()):
-            pass  # 假日暂停时钟引擎
-        else:
-            self._tock()
-
-    def _tock(self):
-        # 间隔事件
-        for handler in self.clock_interval_handlers:
-            if handler.is_active():
-                handler.call()
-                self.push_event_type(handler)
-        # 时刻事件
-        while self.clock_moment_handlers:
-            clock_handler = self.clock_moment_handlers.pop()
-            if clock_handler.is_active():
-                clock_handler.call()
-                self.push_event_type(clock_handler)
-                clock_handler.update_next_time()
-                self.clock_moment_handlers.appendleft(clock_handler)
-            else:
-                self.clock_moment_handlers.append(clock_handler)
-                break
-
-    def push_event_type(self, clock_handler):
-        event = Event(event_type=self.EventType, data=Clock(self.trading_state, clock_handler.clock_type))
-        self.event_engine.put(event)
-
+            now = datetime.datetime.now(self.timezone)
+            
+            if not self._is_trading_date(now):
+                time.sleep(1)
+                continue  # Pause clock engine on holidays
+            
+            # Interval events
+            for interval, trading_only in self.clock_interval_handlers:
+                if not trading_only or self.trading_state:
+                    self._check_interval_event(now, interval)
+            
+            # Moment events
+            for clock_type, (moment, handler) in self.clock_moment_handlers.items():
+                if now.time() >= moment:
+                    if handler:
+                        handler(None)
+                    self.clock_moment_handlers[clock_type] = (moment, None)
+            
+            # Re-sort triggered events
+            self.clock_moment_handlers = dict(sorted(
+                self.clock_moment_handlers.items(),
+                key=lambda x: x[1][0]
+            ))
+            
+            time.sleep(1)
+    
     def stop(self):
+        """Stop clock engine"""
         self.is_active = False
-
-    def is_tradetime_now(self):
-        return etime.is_tradetime(self.now_dt)
-
-    def register_moment(self, clock_type, moment, makeup=False):
-        return self._register_moment(clock_type, moment, makeup=makeup)
-
-    def _register_moment(self, clock_type, moment, is_trading_date=True, makeup=False, call=None):
-        handlers = list(self.clock_moment_handlers)
-        handler = ClockMomentHandler(self, clock_type, moment, is_trading_date, makeup, call)
-        handlers.append(handler)
-
-        # 触发事件重新排序
-        handlers.sort(key=lambda h: h.next_time, reverse=True)
-        self.clock_moment_handlers = deque(handlers)
-        return handler
-
-    def register_interval(self, interval_minute, trading=True):
-        return self._register_interval(interval_minute, trading)
-
-    def _register_interval(self, interval_minute, trading=True, call=None):
-        handler = ClockIntervalHandler(self, interval_minute, trading, call)
-        self.clock_interval_handlers.add(handler)
-        return handler

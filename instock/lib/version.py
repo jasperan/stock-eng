@@ -1,8 +1,5 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
-__author__ = 'myh '
-__date__ = '2023/3/11 '
-
-__version__ = "4.0.0"
-# 每次发布时候更新。
+# Update version number with each release
+__version__ = "1.0.0"

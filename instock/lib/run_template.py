@@ -1,58 +1,38 @@
-#!/usr/local/bin/python
+#!/usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
-
-import logging
-import datetime
-import concurrent.futures
 import sys
-import time
-import instock.lib.trade_time as trd
+import datetime
+import pandas as pd
 
-__author__ = 'myh '
-__date__ = '2023/3/10 '
-
-
-# 通用函数，获得日期参数，支持批量作业。
-def run_with_args(run_fun, *args):
+def get_run_date_list():
+    """
+    Common function to get date parameters, supports batch processing.
+    Returns a list of dates to process.
+    """
+    run_date_list = []
+    
+    # If no arguments provided, use current date
+    if len(sys.argv) == 1:
+        run_date_list.append(datetime.datetime.now().strftime("%Y-%m-%d"))
+        return run_date_list
+    
+    # Interval job: python xxx.py 2023-03-01 2023-03-21
     if len(sys.argv) == 3:
-        # 区间作业 python xxx.py 2023-03-01 2023-03-21
-        tmp_year, tmp_month, tmp_day = sys.argv[1].split("-")
-        start_date = datetime.datetime(int(tmp_year), int(tmp_month), int(tmp_day)).date()
-        tmp_year, tmp_month, tmp_day = sys.argv[2].split("-")
-        end_date = datetime.datetime(int(tmp_year), int(tmp_month), int(tmp_day)).date()
-        run_date = start_date
-        try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                while run_date <= end_date:
-                    if trd.is_trade_date(run_date):
-                        executor.submit(run_fun, run_date, *args)
-                        time.sleep(2)
-                    run_date += datetime.timedelta(days=1)
-        except Exception as e:
-            logging.error(f"run_template.run_with_args处理异常：{run_fun}{sys.argv}{e}")
-    elif len(sys.argv) == 2:
-        # N个时间作业 python xxx.py 2023-03-01,2023-03-02
-        dates = sys.argv[1].split(',')
-        try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                for date in dates:
-                    tmp_year, tmp_month, tmp_day = date.split("-")
-                    run_date = datetime.datetime(int(tmp_year), int(tmp_month), int(tmp_day)).date()
-                    if trd.is_trade_date(run_date):
-                        executor.submit(run_fun, run_date, *args)
-                        time.sleep(2)
-        except Exception as e:
-            logging.error(f"run_template.run_with_args处理异常：{run_fun}{sys.argv}{e}")
-    else:
-        # 当前时间作业 python xxx.py
-        try:
-            run_date, run_date_nph = trd.get_trade_date_last()
-            if run_fun.__name__.startswith('save_nph'):
-                run_fun(run_date_nph, False)
-            elif run_fun.__name__.startswith('save_after_close'):
-                run_fun(run_date, *args)
-            else:
-                run_fun(run_date_nph, *args)
-        except Exception as e:
-            logging.error(f"run_template.run_with_args处理异常：{run_fun}{sys.argv}{e}")
+        start_date = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%d")
+        end_date = datetime.datetime.strptime(sys.argv[2], "%Y-%m-%d")
+        date_range = pd.date_range(start=start_date, end=end_date)
+        for date in date_range:
+            run_date_list.append(date.strftime("%Y-%m-%d"))
+        return run_date_list
+    
+    # Multiple dates job: python xxx.py 2023-03-01,2023-03-02
+    if "," in sys.argv[1]:
+        dates = sys.argv[1].split(",")
+        for date in dates:
+            run_date_list.append(date)
+        return run_date_list
+    
+    # Current date job: python xxx.py
+    run_date_list.append(sys.argv[1])
+    return run_date_list

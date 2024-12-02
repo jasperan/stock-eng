@@ -1,33 +1,27 @@
 #!/usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
-from abc import ABC
+import os.path
 import tornado.web
-import instock.core.singleton_stock_web_module_data as sswmd
+import configparser
+from abc import ABC
 
-__author__ = 'myh '
-__date__ = '2023/3/10 '
-
-
-# 基础handler，主要负责检查mysql的数据库链接。
+# Base handler, mainly responsible for checking MySQL database connection
 class BaseHandler(tornado.web.RequestHandler, ABC):
     @property
     def db(self):
-        try:
-            # check every time。
-            self.application.db.query("SELECT 1 ")
-        except Exception as e:
-            print(e)
-            self.application.db.reconnect()
         return self.application.db
 
+    def get(self):
+        self.render("index.html", leftMenu=GetLeftMenu(self.request.uri))
 
-class LeftMenu:
-    def __init__(self, url):
-        self.leftMenuList = sswmd.stock_web_module_data().get_data_list()
-        self.current_url = url
-
-
-# 获得左菜单。
-def GetLeftMenu(url):
-    return LeftMenu(url)
+# Get left menu
+def GetLeftMenu(uri):
+    config = configparser.ConfigParser()
+    config_path = os.path.join(os.path.dirname(__file__), "config.ini")
+    config.read(config_path)
+    menu_data = config.items("menu")
+    menu_list = []
+    for menu_item in menu_data:
+        menu_list.append({"url": menu_item[1], "name": menu_item[0], "active": "active" if uri == menu_item[1] else ""})
+    return menu_list
